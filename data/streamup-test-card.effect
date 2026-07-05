@@ -1,0 +1,159 @@
+// StreamUP Test Card — background pattern effect.
+//
+// Ported from streamup-test-card.shader (Exeldro obs-shaderfilter version).
+// This effect renders ONLY the background pattern (colour bars, grid + crosshair,
+// solid colour, or a user image) plus an optional frame border. The label plate
+// and text are rendered on the CPU with QPainter into the `overlay` texture and
+// composited here — the shader can't lay out real typed text, the filter can.
+//
+// The parent source (`image`) is intentionally ignored: a test card replaces
+// whatever it is applied to, exactly like the shader filter did on a Colour Source.
+
+uniform float4x4 ViewProj;
+uniform texture2d image;        // parent source — required by process_filter_end, unused
+uniform texture2d overlay;      // tight plate + text bitmap, premultiplied RGBA
+uniform texture2d bg_image;     // user background image (Image style)
+
+uniform float2 dimension;       // frame size in pixels
+uniform float2 overlay_size;    // plate+text bitmap size in pixels (0 = no label)
+uniform float2 text_offset;     // label offset from centre in pixels
+
+uniform int background_style;   // 0 bars, 1 grid, 2 solid, 3 image
+uniform float4 solid_color;     // solid fill / grid backdrop / image letterbox
+uniform float bars_level;       // colour-bar brightness (0.75 = broadcast 75%)
+
+uniform float4 grid_color;      // grid line + crosshair colour
+uniform float grid_spacing;     // px between grid lines
+uniform float grid_line_width;  // px
+uniform float crosshair_width;  // px (0 = hidden)
+
+uniform int image_fit;          // 0 stretch, 1 fit (letterbox), 2 fill (crop)
+uniform float image_aspect;     // width / height ratio of the image
+
+uniform float4 border_color;
+uniform float border_width;     // px (0 = disabled)
+
+sampler_state linearClamp {
+	Filter   = Linear;
+	AddressU = Clamp;
+	AddressV = Clamp;
+};
+
+struct VertData {
+	float4 pos : POSITION;
+	float2 uv  : TEXCOORD0;
+};
+
+VertData VSDefault(VertData v_in)
+{
+	VertData v_out;
+	v_out.pos = mul(float4(v_in.pos.xyz, 1.0), ViewProj);
+	v_out.uv  = v_in.uv;
+	return v_out;
+}
+
+float4 PSTestCard(VertData v_in) : TARGET
+{
+	float2 uv  = v_in.uv;
+	float2 dim = max(dimension, float2(1.0, 1.0));
+	float2 px  = uv * dim;
+
+	// ---------------------------------------------------------------------
+	// Background
+	// ---------------------------------------------------------------------
+	float3 bg = solid_color.rgb;
+
+	if (background_style == 0) {
+		// SMPTE-style 7 colour bars, left to right.
+		int bar = (int)floor(saturate(uv.x) * 7.0);
+		float L = bars_level;
+		float3 c = float3(L, L, L);                    // white / grey
+		if (bar == 1)      c = float3(L, L, 0.0);      // yellow
+		else if (bar == 2) c = float3(0.0, L, L);      // cyan
+		else if (bar == 3) c = float3(0.0, L, 0.0);    // green
+		else if (bar == 4) c = float3(L, 0.0, L);      // magenta
+		else if (bar == 5) c = float3(L, 0.0, 0.0);    // red
+		else if (bar == 6) c = float3(0.0, 0.0, L);    // blue
+		bg = c;
+	}
+	else if (background_style == 1) {
+		// Grid + centre crosshair.
+		float spacing = max(grid_spacing, 2.0);
+		float half_w  = grid_line_width * 0.5;
+
+		float mx = fmod(px.x, spacing);
+		float my = fmod(px.y, spacing);
+		float dLineX = min(mx, spacing - mx);
+		float dLineY = min(my, spacing - my);
+		float vline = 1.0 - smoothstep(half_w, half_w + 1.0, dLineX);
+		float hline = 1.0 - smoothstep(half_w, half_w + 1.0, dLineY);
+		float lines = max(vline, hline);
+
+		float ch = crosshair_width * 0.5;
+		float crossV = 1.0 - smoothstep(ch, ch + 1.0, abs(px.x - dim.x * 0.5));
+		float crossH = 1.0 - smoothstep(ch, ch + 1.0, abs(px.y - dim.y * 0.5));
+		float cross = max(crossV, crossH) * step(0.01, crosshair_width);
+
+		float m = max(lines, cross);
+		bg = lerp(solid_color.rgb, grid_color.rgb, m * grid_color.a);
+	}
+	else if (background_style == 3) {
+		// User image, mapped per fit mode.
+		float2 iuv = uv;
+		if (image_fit != 0) {
+			float frameAspect = dim.x / max(dim.y, 1.0);
+			float d = frameAspect / max(image_aspect, 1e-4);
+
+			bool coverMode = (image_fit == 2);
+			// Fit shrinks the long axis (letterbox); Fill zooms the short axis (crop).
+			if (d > 1.0) {
+				if (coverMode) iuv = float2(uv.x, (uv.y - 0.5) / d + 0.5);
+				else           iuv = float2((uv.x - 0.5) * d + 0.5, uv.y);
+			} else {
+				if (coverMode) iuv = float2((uv.x - 0.5) * d + 0.5, uv.y);
+				else           iuv = float2(uv.x, (uv.y - 0.5) / d + 0.5);
+			}
+		}
+
+		float inside = step(0.0, iuv.x) * step(iuv.x, 1.0) * step(0.0, iuv.y) * step(iuv.y, 1.0);
+		float4 img = bg_image.Sample(linearClamp, saturate(iuv));
+		bg = lerp(solid_color.rgb, img.rgb, img.a * inside);
+	}
+
+	float3 outRGB = bg;
+
+	// ---------------------------------------------------------------------
+	// Label plate + text — a tight premultiplied bitmap painted on the CPU
+	// (QPainter), placed at the frame centre plus the offset, exactly like the
+	// shader positioned its text block. Composited premultiplied-over.
+	// ---------------------------------------------------------------------
+	if (overlay_size.x > 0.0 && overlay_size.y > 0.0) {
+		float2 center = dim * 0.5 + text_offset;
+		float2 origin = center - overlay_size * 0.5;
+		float2 ouv = (px - origin) / overlay_size;
+		if (ouv.x >= 0.0 && ouv.x <= 1.0 && ouv.y >= 0.0 && ouv.y <= 1.0) {
+			float4 ov = overlay.Sample(linearClamp, ouv);
+			outRGB = ov.rgb + outRGB * (1.0 - ov.a);   // premultiplied over
+		}
+	}
+
+	// ---------------------------------------------------------------------
+	// Frame border
+	// ---------------------------------------------------------------------
+	if (border_width > 0.0) {
+		float edgeDist = min(min(px.x, dim.x - px.x), min(px.y, dim.y - px.y));
+		float bMask = (1.0 - smoothstep(border_width - 1.0, border_width + 1.0, edgeDist)) * border_color.a;
+		outRGB = lerp(outRGB, border_color.rgb, bMask);
+	}
+
+	return float4(outRGB, 1.0);
+}
+
+technique Draw
+{
+	pass
+	{
+		vertex_shader = VSDefault(v_in);
+		pixel_shader  = PSTestCard(v_in);
+	}
+}
