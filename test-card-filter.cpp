@@ -68,6 +68,7 @@ struct test_card_filter {
 	gs_effect_t *effect = nullptr;
 
 	// effect params
+	gs_eparam_t *p_image = nullptr;
 	gs_eparam_t *p_overlay = nullptr, *p_bg_image = nullptr;
 	gs_eparam_t *p_dimension = nullptr, *p_overlay_size = nullptr, *p_text_offset = nullptr;
 	gs_eparam_t *p_background_style = nullptr, *p_solid_color = nullptr, *p_bars_level = nullptr;
@@ -251,6 +252,7 @@ static void *tc_create(obs_data_t *settings, obs_source_t *source)
 	bfree(path);
 
 	if (f->effect) {
+		f->p_image = gs_effect_get_param_by_name(f->effect, "image");
 		f->p_overlay = gs_effect_get_param_by_name(f->effect, "overlay");
 		f->p_bg_image = gs_effect_get_param_by_name(f->effect, "bg_image");
 		f->p_dimension = gs_effect_get_param_by_name(f->effect, "dimension");
@@ -301,6 +303,77 @@ static void tc_destroy(void *data)
 	bfree(f);
 }
 
+// Effective card size: the source we are attached to, or the canvas resolution
+// when that source has no frame yet (a video capture device that is unplugged,
+// switched off, or still starting up reports 0x0). A test card is a placeholder,
+// so it should still draw at a sensible size instead of vanishing.
+static void tc_effective_size(struct test_card_filter *f, uint32_t *w, uint32_t *h)
+{
+	obs_source_t *target = obs_filter_get_target(f->context);
+	uint32_t tw = target ? obs_source_get_base_width(target) : 0;
+	uint32_t th = target ? obs_source_get_base_height(target) : 0;
+	if (tw == 0 || th == 0) {
+		struct obs_video_info ovi;
+		if (obs_get_video_info(&ovi) && ovi.base_width && ovi.base_height) {
+			tw = ovi.base_width;
+			th = ovi.base_height;
+		} else {
+			tw = 1920;
+			th = 1080;
+		}
+	}
+	*w = tw;
+	*h = th;
+}
+
+// Reporting a non-zero size even when the source has no frame is what makes OBS
+// render the filter at all (a 0x0 source is never drawn), so the fallback below
+// actually gets a chance to run.
+static uint32_t tc_get_width(void *data)
+{
+	uint32_t w, h;
+	tc_effective_size((struct test_card_filter *)data, &w, &h);
+	return w;
+}
+
+static uint32_t tc_get_height(void *data)
+{
+	uint32_t w, h;
+	tc_effective_size((struct test_card_filter *)data, &w, &h);
+	return h;
+}
+
+// Push every per-frame uniform to the effect. Shared by the normal filter path
+// and the direct-draw fallback so they stay in lock-step.
+static void tc_set_effect_params(struct test_card_filter *f, uint32_t w, uint32_t h,
+				 int overlay_w, int overlay_h)
+{
+	struct vec2 dim;
+	vec2_set(&dim, (float)w, (float)h);
+	struct vec2 osz;
+	vec2_set(&osz, (float)(overlay_w > 0 ? overlay_w : 0), (float)(overlay_h > 0 ? overlay_h : 0));
+	struct vec2 toff;
+	vec2_set(&toff, f->text_off_x, f->text_off_y);
+
+	gs_effect_set_vec2(f->p_dimension, &dim);
+	gs_effect_set_vec2(f->p_overlay_size, &osz);
+	gs_effect_set_vec2(f->p_text_offset, &toff);
+	gs_effect_set_int(f->p_background_style, f->background_style);
+	gs_effect_set_vec4(f->p_solid_color, &f->solid_color);
+	gs_effect_set_float(f->p_bars_level, f->bars_level);
+	gs_effect_set_vec4(f->p_grid_color, &f->grid_color);
+	gs_effect_set_float(f->p_grid_spacing, f->grid_spacing);
+	gs_effect_set_float(f->p_grid_line_width, f->grid_line_width);
+	gs_effect_set_float(f->p_crosshair_width, f->crosshair_width);
+	gs_effect_set_int(f->p_image_fit, f->image_fit);
+	gs_effect_set_float(f->p_image_aspect, f->image_aspect);
+	gs_effect_set_vec4(f->p_border_color, &f->border_color);
+	gs_effect_set_float(f->p_border_width, f->border_width);
+
+	gs_effect_set_texture(f->p_overlay, f->overlay_tex ? f->overlay_tex : f->blank_tex);
+	gs_effect_set_texture(f->p_bg_image, f->bg_img_loaded ? f->bg_img.texture : f->blank_tex);
+}
+
 static void tc_render(void *data, gs_effect_t *)
 {
 	auto *f = (struct test_card_filter *)data;
@@ -310,12 +383,8 @@ static void tc_render(void *data, gs_effect_t *)
 	}
 
 	obs_source_t *target = obs_filter_get_target(f->context);
-	uint32_t w = target ? obs_source_get_base_width(target) : 0;
-	uint32_t h = target ? obs_source_get_base_height(target) : 0;
-	if (w == 0 || h == 0) {
-		obs_source_skip_video_filter(f->context);
-		return;
-	}
+	uint32_t tw = target ? obs_source_get_base_width(target) : 0;
+	uint32_t th = target ? obs_source_get_base_height(target) : 0;
 
 	int overlay_w, overlay_h;
 	{
@@ -342,35 +411,32 @@ static void tc_render(void *data, gs_effect_t *)
 		}
 	}
 
-	if (!obs_source_process_filter_begin(f->context, GS_RGBA, OBS_ALLOW_DIRECT_RENDERING))
+	// Normal path: the source has a real frame, so composite over it. This keeps
+	// the card locked to the source's own resolution.
+	if (tw != 0 && th != 0) {
+		if (!obs_source_process_filter_begin(f->context, GS_RGBA, OBS_ALLOW_DIRECT_RENDERING))
+			return;
+		tc_set_effect_params(f, tw, th, overlay_w, overlay_h);
+		obs_source_process_filter_end(f->context, f->effect, tw, th);
 		return;
+	}
 
-	struct vec2 dim;
-	vec2_set(&dim, (float)w, (float)h);
-	struct vec2 osz;
-	vec2_set(&osz, (float)(overlay_w > 0 ? overlay_w : 0), (float)(overlay_h > 0 ? overlay_h : 0));
-	struct vec2 toff;
-	vec2_set(&toff, f->text_off_x, f->text_off_y);
+	// Fallback: the source has no frame yet (capture device not available). The
+	// process_filter path bails on a 0x0 target, so draw the card directly at the
+	// canvas resolution. The card ignores the source's pixels anyway, so binding a
+	// blank texture for the (unused) parent is fine.
+	uint32_t w, h;
+	tc_effective_size(f, &w, &h);
+	tc_set_effect_params(f, w, h, overlay_w, overlay_h);
+	if (f->p_image)
+		gs_effect_set_texture(f->p_image, f->blank_tex);
 
-	gs_effect_set_vec2(f->p_dimension, &dim);
-	gs_effect_set_vec2(f->p_overlay_size, &osz);
-	gs_effect_set_vec2(f->p_text_offset, &toff);
-	gs_effect_set_int(f->p_background_style, f->background_style);
-	gs_effect_set_vec4(f->p_solid_color, &f->solid_color);
-	gs_effect_set_float(f->p_bars_level, f->bars_level);
-	gs_effect_set_vec4(f->p_grid_color, &f->grid_color);
-	gs_effect_set_float(f->p_grid_spacing, f->grid_spacing);
-	gs_effect_set_float(f->p_grid_line_width, f->grid_line_width);
-	gs_effect_set_float(f->p_crosshair_width, f->crosshair_width);
-	gs_effect_set_int(f->p_image_fit, f->image_fit);
-	gs_effect_set_float(f->p_image_aspect, f->image_aspect);
-	gs_effect_set_vec4(f->p_border_color, &f->border_color);
-	gs_effect_set_float(f->p_border_width, f->border_width);
-
-	gs_effect_set_texture(f->p_overlay, f->overlay_tex ? f->overlay_tex : f->blank_tex);
-	gs_effect_set_texture(f->p_bg_image, f->bg_img_loaded ? f->bg_img.texture : f->blank_tex);
-
-	obs_source_process_filter_end(f->context, f->effect, w, h);
+	gs_blend_state_push();
+	gs_blend_function_separate(GS_BLEND_SRCALPHA, GS_BLEND_INVSRCALPHA, GS_BLEND_ONE,
+				   GS_BLEND_INVSRCALPHA);
+	while (gs_effect_loop(f->effect, "Draw"))
+		gs_draw_sprite(nullptr, 0, w, h);
+	gs_blend_state_pop();
 }
 
 // ---------------------------------------------------------------------------
@@ -555,6 +621,8 @@ void register_test_card_filter(void)
 	info.create = tc_create;
 	info.destroy = tc_destroy;
 	info.update = tc_update;
+	info.get_width = tc_get_width;
+	info.get_height = tc_get_height;
 	info.video_render = tc_render;
 	info.get_properties = tc_properties;
 	info.get_defaults = tc_defaults;
