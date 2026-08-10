@@ -29,6 +29,8 @@ Grab ready-made examples and the rest of the range at [StreamUP](https://streamu
 
 ## Build
 
+Requires OBS Studio 31.1 or newer.
+
 **In-tree build:**
 1. Build OBS Studio: https://obsproject.com/wiki/Install-Instructions
 2. Check out this repository to `frontend/plugins/obs-streamup-test-card`
