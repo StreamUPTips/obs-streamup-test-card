@@ -41,6 +41,10 @@ Requires OBS Studio 31.1 or newer.
 1. Make sure you have the OBS development packages installed
 2. Check out this repository and run `cmake -S . -B build -DBUILD_OUT_OF_TREE=On && cmake --build build`
 
+## Feedback
+
+There's a **Send Feedback** button at the bottom of the filter properties, or drop requests in the [StreamUP Discord](https://discord.com/invite/RnDKRaVCEu).
+
 ## Support
 
 Built and maintained by Andi. If you're getting use out of this, consider chucking some support his way.
