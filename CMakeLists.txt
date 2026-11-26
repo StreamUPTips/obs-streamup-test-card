@@ -30,20 +30,10 @@ endif()
 find_package(Qt6 COMPONENTS Widgets Core Gui Network REQUIRED)
 target_link_libraries(${PROJECT_NAME} PRIVATE Qt::Core Qt::Widgets Qt::Gui Qt::Network)
 
-# Shared StreamUP UI design system (obs-streamup-ui-gallery), vendored under
-# shared/obs-streamup-ui/ and compiled directly in (no shared sub-target). We
-# only need the in-app feedback dialog here.
-set(STREAMUP_UI_DIR "${CMAKE_CURRENT_SOURCE_DIR}/shared/obs-streamup-ui")
-target_include_directories(${PROJECT_NAME} PRIVATE
-  "${STREAMUP_UI_DIR}/include"
-  "${STREAMUP_UI_DIR}/include/streamup/ui"
-)
-target_sources(${PROJECT_NAME} PRIVATE
-  "${STREAMUP_UI_DIR}/src/feedback.cpp"                       # shared feedback dialog
-  "${STREAMUP_UI_DIR}/src/switch-button.cpp"                  # pulled in by feedback.cpp
-  "${STREAMUP_UI_DIR}/include/streamup/ui/switch-button.hpp"  # Q_OBJECT -> AUTOMOC
-  "${STREAMUP_UI_DIR}/include/streamup/ui/ios-checkbox.hpp"   # Q_OBJECT -> AUTOMOC
-)
+# Shared StreamUP UI library: a git submodule pinned to a tag
+# (https://github.com/StreamUPTips/obs-streamup-ui). Compiled into the plugin.
+include("${CMAKE_CURRENT_SOURCE_DIR}/shared/obs-streamup-ui/cmake/streamup-ui.cmake")
+streamup_ui_add(${PROJECT_NAME})
 
 # Extra Qt linkage on older Qt versions for *nix
 if((OS_LINUX OR OS_FREEBSD OR OS_OPENBSD) AND Qt_VERSION VERSION_LESS "6.9.0")
