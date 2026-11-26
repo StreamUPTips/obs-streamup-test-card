@@ -2,12 +2,17 @@
 #include "version.h"
 
 #include <obs-module.h>
+#include <streamup/ui/theme.hpp>
 
 OBS_DECLARE_MODULE()
 OBS_MODULE_USE_DEFAULT_LOCALE("streamup-test-card", "en-US")
 
 bool obs_module_load(void)
 {
+	// Every StreamUP window takes its colours from the active StreamUP theme
+	// variant (The Andi's gold under any other theme), and follows theme changes.
+	StreamUP::Kit::Theme::Follow();
+
 	blog(LOG_INFO, "[StreamUP Test Card] Plugin loaded (version %s)", PROJECT_VERSION);
 	register_test_card_filter();
 	return true;
